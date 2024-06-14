@@ -1,9 +1,9 @@
 import { BlockModel, Block, Slot, defineBlockSchema, SchemaToModel } from "@blocksuite/store";
 import { BlockElement, BlockService, PathFinder } from "@blocksuite/block-std"
 import { DisposableGroup, Disposable } from "@blocksuite/global/utils";
-import { DisposableResults, ObservableSet, observeChildren, reactive } from "../utils.js";
-import { customElement } from "lit/decorators.js";
-import { TemplateResult, nothing } from "lit";
+import { DisposableResults, ObservableSet, multiDisposeSafe, observeChildren, reactive } from "../utils.js";
+import { customElement, state } from "lit/decorators.js";
+import { TemplateResult, html, nothing } from "lit";
 import { choose } from "lit/directives/choose.js";
 
 export const ViewRequestRootFlavour = "view-requestroot"
@@ -42,10 +42,11 @@ export interface ViewRootProps {
 }
 
 export interface ViewRequestProps {
-    containingElementPath: string
+    requestViewElementPath: string
 }
 
 export interface ViewProps {
+    requestId: BlockModel["id"]
 }
 
 export interface BlockViewRequestProps extends ViewRequestProps {
@@ -74,7 +75,7 @@ export const ViewRequestSchema = defineBlockSchema({
         parent: [ViewRequestFlavour],
     },
     props: (internal): ViewRequestProps => ({
-        containingElementPath: '',
+        requestViewElementPath: '',
     }),
 })
 
@@ -240,6 +241,7 @@ export type DirectedRelationshipViewRequestModel<
 export const BlockViewSchema = defineBlockSchema({
     flavour: BlockViewFlavour,
     props: (internal): BlockViewProps => ({
+        requestId: "",
         blockId: "",
     }),
     metadata: {
@@ -253,6 +255,8 @@ export interface BlockViewModel<
     > extends Omit<SchemaToModel<typeof BlockViewSchema>, "flavour"> {
     flavour: BlockViewFlavour
     
+    request: BlockViewRequestModel
+
     block: Block & { model: RealModel }
     blockModel: RealModel
     blockChanged: Slot<{
@@ -265,7 +269,7 @@ export const BlockViewRequestSchema = defineBlockSchema({
     flavour: BlockViewRequestFlavour,
     props: (internal): BlockViewRequestProps => ({
         blockId: "",
-        containingElementPath: "",
+        requestViewElementPath: "",
     }),
     metadata: {
         role: "content",
@@ -276,49 +280,58 @@ export const BlockViewRequestSchema = defineBlockSchema({
 export interface BlockViewRequestModel extends SchemaToModel<typeof BlockViewRequestSchema> {
 }
 
+@customElement(BlockViewFlavour)
+export class BlockViewElement extends BlockElement<BlockViewModel> {
+    override renderBlock(): unknown {
+        return this.renderChildren(this.model)
+    }
+}
+
 @customElement(BlockViewRequestFlavour)
 export class BlockViewRequestView extends BlockElement<BlockViewRequestModel, BlockViewRequestService> {
-    private isSelected = false
+    @state()
+    isSelected = false
 
-    private readonly volunteer: BlockViewContainerVolunteer = {
+    private readonly volunteer: BlockViewContainer = {
         changed: new Slot(),
 
-        canRender: request =>
-            request.containingElementPath ===
-            PathFinder.pathToKey(this.path),
+        canPlace: view =>
+            view.request.id === this.model.id,
         
-        renderBlock: block => {
-            if (block.id !== this.model.blockId)
+        place: view => {
+            if (view.request.id !== this.model.id)
                 throw new Error("cannot render except specific block")
 
+            this.doc.moveBlocks([view], this.model)
             this.isSelected = true
+
             return {
                 dispose: () => {
                     this.isSelected = false
-                    this.requestUpdate()
                 },
             }
         },
     }
 
     override connectedCallback(): void {
-        this.service.volunteerBlockViewContainers.add(this.volunteer)
+        super.connectedCallback()
+
+        this.model.requestViewElementPath = PathFinder.pathToKey(this.path)
+
+        this.service.blockViewContainers.add(this.volunteer)
     }
 
     override disconnectedCallback(): void {
-        this.service.volunteerBlockViewContainers.delete(this.volunteer)
+        super.disconnectedCallback()
+
+        this.service.blockViewContainers.delete(this.volunteer)
     }
 
     override renderBlock() {
-        return choose(
-            this.isSelected,
-            [
-                [true, () => this.renderChildren({
-                    children: [this.doc.getBlock(this.model.blockId)!.model]
-                } as BlockModel)],
-                [false, () => nothing as unknown as TemplateResult]
-            ]
-        )
+        if (!this.isSelected)
+            return nothing
+
+        return this.renderChildren(this.model)
     }
 }
 
@@ -327,7 +340,7 @@ export class BlockViewRequestSolution implements ViewRequestSolution<BlockViewRe
     
     constructor(
         public readonly request: BlockViewRequestModel,
-        public readonly containerVolunteer: BlockViewContainerVolunteer,
+        public readonly containerVolunteer: BlockViewContainer,
     ) { }
 
     implement(service: ViewRequestService): Disposable {
@@ -350,8 +363,8 @@ export class BlockViewRequestSolution implements ViewRequestSolution<BlockViewRe
 export class BlockViewRequestSolver implements ViewRequestSolver {
     solve(request: ViewRequestModel, service: ViewRequestService) {
         type Request = BlockViewRequestModel
-        const realBlock_request = <Request>request
-        if (!(('blockId' satisfies keyof Request) in realBlock_request))
+        const block_request = <Request>request
+        if (!(('blockId' satisfies keyof Request) in block_request))
             return
 
         const blockViewService = service.std.spec.getService(BlockViewRequestFlavour)
@@ -360,19 +373,19 @@ export class BlockViewRequestSolver implements ViewRequestSolver {
 
         const solutions = new ObservableSet<BlockViewRequestSolution>()
 
-        disposable.add(blockViewService.volunteerBlockViewContainers.observe(volunteer => {
+        disposable.add(blockViewService.blockViewContainers.observe(volunteer => {
             const disposable = new DisposableGroup()
             let solution: BlockViewRequestSolution
 
             const evaluate = () => {
-                const isEligibleNow = volunteer.canRender(realBlock_request)
+                const isEligibleNow = volunteer.canPlace(block_request)
                 const wasEligible = solution !== undefined
 
                 if (isEligibleNow) {
                     if (wasEligible)
                         solutions.delete(solution)
 
-                    solution = new BlockViewRequestSolution(realBlock_request, volunteer)
+                    solution = new BlockViewRequestSolution(block_request, volunteer)
 
                     solutions.add(solution)
                 }
@@ -396,57 +409,115 @@ export class BlockViewRequestSolver implements ViewRequestSolver {
     }
 }
 
-interface BlockViewContainerVolunteer {
+interface BlockViewContainer {
     changed: Slot
     
-    canRender(request: BlockViewRequestModel): boolean
-    renderBlock(request: BlockViewRequestModel): Disposable
+    canPlace(view: BlockViewModel): boolean
+    place(view: BlockViewModel): Disposable
 }
 
 class BlockViewContainerSelection implements Disposable {
-    readonly volunteers = new ObservableSet<BlockViewContainerVolunteer>()
-    readonly selection = new ObservableSet<BlockViewContainerVolunteer>()
+    readonly volunteers = new ObservableSet<BlockViewContainer>()
+    readonly selection = new ObservableSet<BlockViewContainer>()
 
-    private readonly renderDisposables = new Map<BlockViewContainerVolunteer, Disposable>()
-    private readonly disposable = new DisposableGroup()
+    private readonly placements = new Map<BlockViewContainer, Disposable>()
+    readonly disposable = new DisposableGroup()
+    private readonly selfDisposable: Disposable
 
-    constructor(readonly block: BlockModel) {
+    constructor(readonly block: BlockModel, readonly service: BlockViewRequestService) {
         this.disposable.add(this.volunteers)
         this.disposable.add(this.selection)
 
         this.disposable.add(this.selection.slots.add.on(volunteer => {
-            this.renderDisposables.set(volunteer, volunteer.renderBlock(this.block))
+            const viewSearch = service.views(block)
+
+            const placementDisposable = new DisposableGroup()
+
+            placementDisposable.add(viewSearch.disposable)
+            placementDisposable.add(viewSearch.results.observe(view => {
+                if (!volunteer.canPlace(view))
+                    return
+
+                return volunteer.place(view)
+            }))
+
+            this.placements.set(volunteer, placementDisposable)
         }))
         this.disposable.add(this.selection.slots.delete.on(volunteer => {
-            this.renderDisposables.get(volunteer)!.dispose()
-            this.renderDisposables.delete(volunteer)
+            this.placements.get(volunteer)!.dispose()
+            this.placements.delete(volunteer)
         }))
 
-        this.disposable.add(block.deleted.on(() => {
-            this.dispose()
-        }))
+        this.disposable.add(
+            block.deleted.on(() => {
+                this.dispose()
+            })
+        )
+
+        this.disposable.add(() =>
+            this.placements.forEach(placement =>
+                placement.dispose()
+            )
+        )
+
+        this.selfDisposable = multiDisposeSafe(this.disposable)
     }
 
     dispose() {
-        this.disposable.dispose()
-        this.renderDisposables.forEach(disposable => disposable.dispose())
+        this.selfDisposable.dispose()
     }
 }
 
+export interface BlockViewer<RealModel extends BlockModel = BlockModel> {
+    isModel(model: BlockModel): model is RealModel
+    view(model: RealModel, service: BlockViewService): ObservableSet<BlockViewModel<RealModel>> | void
+}
+
 export class BlockViewRequestService extends BlockService<BlockViewRequestModel> {
-    readonly volunteerBlockViewContainers = new ObservableSet<BlockViewContainerVolunteer>()
+    readonly blockViewContainers = new ObservableSet<BlockViewContainer>()
     
     readonly blockViewContainerSelections = new Map<BlockModel, BlockViewContainerSelection>()
+
+    readonly blockViewers = new ObservableSet<BlockViewer>()
 
     selectionContainer(block: BlockModel) {
         const existing = this.blockViewContainerSelections.get(block)
         if (existing)
             return existing
 
-        const newContainer = new BlockViewContainerSelection(block)
+        const newContainer = new BlockViewContainerSelection(block, this)
         this.blockViewContainerSelections.set(block, newContainer)
         block.deleted.on(() => this.blockViewContainerSelections.delete(block))
         return newContainer
+    }
+
+    views<RealModel extends BlockModel = BlockModel>(block: RealModel): DisposableResults<ObservableSet<BlockViewModel<RealModel>>> {
+        const views = new ObservableSet<BlockViewModel<RealModel>>()
+
+        const blockViewService = this.std.spec.getService(BlockViewFlavour)
+
+        const disposable = new DisposableGroup()
+
+        disposable.add(this.blockViewers.observe(viewer => {
+            if (!viewer.isModel(block))
+                return
+            
+            const subviews = viewer.view(block, blockViewService)
+            if (!subviews)
+                return
+
+            const disposable = new DisposableGroup()
+            disposable.add(subviews.addRevokablyTo(views))
+            disposable.add(subviews)
+
+            return disposable
+        }))
+        disposable.add(views)
+
+        return {
+            results: views,
+            disposable
+        }
     }
 }
 
@@ -523,17 +594,17 @@ export const CanvasChildViewSchema = defineBlockSchema({
 
 @customElement(ViewRequestFlavour)
 export class ViewRequestView extends BlockElement<ViewRequestModel, ViewRequestService> {
-    override connectedCallback(): void {
-        
+    override renderBlock(): unknown {
+        return html`<div>not implemented</div>`
     }
 }
 
 export class CanvasChildViewElement extends BlockElement<CanvasChildViewModel> {
-    private readonly volunteer: BlockViewContainerVolunteer = {
-        canRender: request =>
+    private readonly volunteer: BlockViewContainer = {
+        canPlace: request =>
             request.id === this.model.requestId,
         
-        renderBlock: () => {
+        place: () => {
             
         }
     }
@@ -541,11 +612,11 @@ export class CanvasChildViewElement extends BlockElement<CanvasChildViewModel> {
 
 @customElement(CanvasChildrenViewFlavour)
 export class CanvasChildrenViewElement extends BlockElement<CanvasChildrenViewModel> {
-    private readonly volunteer: BlockViewContainerVolunteer = {
-        canRender: request =>
+    private readonly volunteer: BlockViewContainer = {
+        canPlace: request =>
             request.containingElementPath.startsWith(PathFinder.pathToKey(this.path)),
 
-        renderBlock: request => {
+        place: request => {
             const requestService = this.std.spec.getService(ViewRequestFlavour)
             const canvasChildViewRequestBlock = requestService.request(BlockViewRequestFlavour, {
                 blockId: request.blockId

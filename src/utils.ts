@@ -82,6 +82,18 @@ export class ObservableSet<T> extends Set<T> implements Disposable {
         return safeDisposable
     }
 
+    addRevokable(value: T): Disposable {
+        this.add(value)
+
+        return {
+            dispose: () => this.delete(value)
+        }
+    }
+
+    addRevokablyTo(superset: ObservableSet<T>): Disposable {
+        return this.observe(item => superset.addRevokable(item))
+    }
+
     override add(value: T): this {
         if (this.has(value))
             return this
